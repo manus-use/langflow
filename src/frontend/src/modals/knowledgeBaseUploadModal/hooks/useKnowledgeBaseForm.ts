@@ -8,6 +8,8 @@ import {
   getDBProviderOption,
   getDefaultDBProviderConfig,
   isDBProviderConfigured,
+  resolveUIBackendType,
+  toAPIBackendType,
 } from "@/constants/dbProviderConstants";
 import { api } from "@/controllers/API/api";
 import { getURL } from "@/controllers/API/helpers/constants";
@@ -52,6 +54,10 @@ function validateBackendConfig(
   backendType: AvailableDBProviderId,
   config: Record<string, DBProviderConfigValue>,
 ): string | null {
+  if (backendType === "chroma_cloud") {
+    // API key is validated by isDBProviderConfigured; no literal fields here.
+    return null;
+  }
   if (backendType === "opensearch") {
     const indexName = config.index_name;
     if (typeof indexName !== "string" || !indexName.trim()) {
@@ -228,9 +234,10 @@ export function useKnowledgeBaseForm({
         setColumnConfig(existingKnowledgeBase.columnConfig);
       }
       setBackendType(
-        existingKnowledgeBase.backendType === "opensearch"
-          ? "opensearch"
-          : "chroma",
+        resolveUIBackendType(
+          existingKnowledgeBase.backendType,
+          existingKnowledgeBase.backendConfig as Record<string, unknown> | undefined,
+        ),
       );
       setBackendConfig(
         (existingKnowledgeBase.backendConfig as Record<
@@ -424,7 +431,7 @@ export function useKnowledgeBaseForm({
           embedding_model: selectedModel.id || selectedModel.name,
           model_selection: selectedModel,
           column_config: columnConfig,
-          backend_type: backendType,
+          backend_type: toAPIBackendType(backendType),
           backend_config: backendConfig,
         });
       }

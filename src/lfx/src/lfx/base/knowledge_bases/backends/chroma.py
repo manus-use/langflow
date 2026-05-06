@@ -7,6 +7,12 @@ SQLite "readonly" errors when ingestion and retrieval share a process.
 Heavy lifting (SQLite lock recovery during KB *deletion*) stays in
 ``KBStorageHelper.delete_storage`` since it operates on paths, not on an open
 backend handle.
+
+Cloud mode is enabled by passing ``backend_config={"mode": "cloud", ...}``.
+In cloud mode a ``chromadb.CloudClient`` is used; credentials are resolved
+through Langflow's variable service (or env vars as a fallback) via the
+variable-name keys ``tenant_variable``, ``database_variable``, and
+``api_key_variable``.
 """
 
 from __future__ import annotations
@@ -35,12 +41,21 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
+    from chromadb.api import ClientAPI
     from langchain_core.embeddings import Embeddings
     from langchain_core.vectorstores import VectorStore
 
 
 class ChromaBackend(BaseVectorStoreBackend):
-    """Persistent Chroma collection scoped to a single KB directory."""
+    """Chroma collection scoped to a single KB.
+
+    Operates in two modes controlled by ``backend_config["mode"]``:
+
+    * ``"local"`` (default) — ``chromadb.PersistentClient`` backed by a
+      local directory at ``kb_path``.
+    * ``"cloud"`` — ``chromadb.CloudClient`` connecting to Chroma Cloud;
+      credentials are resolved from Langflow variables (or env vars).
+    """
 
     backend_type = BackendType.CHROMA
 
@@ -59,9 +74,56 @@ class ChromaBackend(BaseVectorStoreBackend):
             embedding_function=embedding_function,
             user_id=user_id,
         )
-        self._client: chromadb.PersistentClient | None = None
+        self._client: chromadb.PersistentClient | ClientAPI | None = None
+        self._resolved_tenant: str | None = None
+        self._resolved_database: str | None = None
+        self._resolved_api_key: str | None = None
+
+    # ---- mode detection --------------------------------------------------
+
+    @property
+    def _is_cloud(self) -> bool:
+        return str(self.backend_config.get("mode", "local")).lower() == "cloud"
+
+    # ---- credential resolution -------------------------------------------
+
+    async def _resolve_secrets(self) -> None:
+        if not self._is_cloud:
+            return
+        cfg = self.backend_config
+        # Only the API key is required by Chroma Cloud. Tenant and database
+        # are optional — when None, chromadb infers them from the API key via
+        # chroma_overwrite_singleton_tenant_database_access_from_auth. Using
+        # resolve_secret (not resolve_required_secret) avoids spurious
+        # "permission denied" errors caused by a stale CHROMA_TENANT env var
+        # from a prior local Chroma setup.
+        self._resolved_api_key = await self.resolve_required_secret(
+            cfg.get("api_key_variable") or "CHROMA_API_KEY"
+        )
+        self._resolved_tenant = await self.resolve_secret(
+            cfg.get("tenant_variable") or "CHROMA_TENANT"
+        )
+        self._resolved_database = await self.resolve_secret(
+            cfg.get("database_variable") or "CHROMA_DATABASE"
+        )
 
     # ---- client plumbing -------------------------------------------------
+
+    def _get_cloud_client(self) -> ClientAPI:
+        cfg = self.backend_config
+        # Always pass the API key; only include tenant/database when explicitly
+        # configured so chromadb can infer them from the API key when absent.
+        kwargs: dict[str, Any] = {"api_key": self._resolved_api_key}
+        if self._resolved_tenant:
+            kwargs["tenant"] = self._resolved_tenant
+        if self._resolved_database:
+            kwargs["database"] = self._resolved_database
+        if cfg.get("cloud_host"):
+            kwargs["cloud_host"] = cfg["cloud_host"]
+        if cfg.get("cloud_port"):
+            kwargs["cloud_port"] = int(cfg["cloud_port"])
+        print("Creating CloudClient with config:", kwargs)
+        return chromadb.CloudClient(**kwargs)
 
     def _get_fresh_client(self) -> chromadb.PersistentClient:
         """Return a Chroma client with a unique session ID.
@@ -89,7 +151,7 @@ class ChromaBackend(BaseVectorStoreBackend):
         )
 
     def _build_vector_store(self) -> VectorStore:
-        self._client = self._get_fresh_client()
+        self._client = self._get_cloud_client() if self._is_cloud else self._get_fresh_client()
         return Chroma(
             client=self._client,
             collection_name=self.kb_name,
@@ -145,6 +207,11 @@ class ChromaBackend(BaseVectorStoreBackend):
                 yield batch
 
     async def test_connection(self) -> TestConnectionResult:
+        if self._is_cloud:
+            return await self._test_cloud_connection()
+        return await self._test_local_connection()
+
+    async def _test_local_connection(self) -> TestConnectionResult:
         """Verify the persistent path is creatable and the client opens.
 
         Chroma is local: ``_build_vector_store`` succeeds for almost any
@@ -184,7 +251,34 @@ class ChromaBackend(BaseVectorStoreBackend):
             details={"path": path_key},
         )
 
+    async def _test_cloud_connection(self) -> TestConnectionResult:
+        """Verify Chroma Cloud credentials and reachability via heartbeat."""
+        try:
+            await self._resolve_secrets()
+            print(self._resolved_tenant, self._resolved_database, self._resolved_api_key)
+            client = self._get_cloud_client()
+            print("HEARTBEAT", client.heartbeat())
+            client.heartbeat()
+        except Exception as exc:  # noqa: BLE001
+            return TestConnectionResult(
+                ok=False,
+                message=str(exc) or type(exc).__name__,
+                details={"type": type(exc).__name__},
+            )
+        cfg = self.backend_config
+        return TestConnectionResult(
+            ok=True,
+            message="Chroma Cloud client connected successfully.",
+            details={
+                "tenant": self._resolved_tenant,
+                "database": self._resolved_database,
+                "host": cfg.get("cloud_host") or "api.trychroma.com",
+            },
+        )
+
     async def storage_size_bytes(self) -> int:
+        if self._is_cloud:
+            return 0
         if not self.kb_path.exists():
             return 0
         total = 0
@@ -202,12 +296,11 @@ class ChromaBackend(BaseVectorStoreBackend):
         Idempotent — safe to call from ``finally`` blocks even when
         ``_build_vector_store`` was never invoked.
         """
-        path_key = str(self.kb_path)
-        with contextlib.suppress(KeyError):
-            # Intentionally silent: a missing key means someone else already
-            # cleaned up this path.
-            if path_key in SharedSystemClient._identifier_to_system:  # noqa: SLF001
-                del SharedSystemClient._identifier_to_system[path_key]  # noqa: SLF001
+        if not self._is_cloud:
+            path_key = str(self.kb_path)
+            with contextlib.suppress(KeyError):
+                if path_key in SharedSystemClient._identifier_to_system:  # noqa: SLF001
+                    del SharedSystemClient._identifier_to_system[path_key]  # noqa: SLF001
 
         self._vector_store = None
         self._client = None

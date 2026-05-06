@@ -183,3 +183,243 @@ class TestChromaBackendStorage:
             embedding_function=_DeterministicEmbeddings(),
         )
         assert await bk.storage_size_bytes() == 0
+
+
+# ---------------------------------------------------------------------------
+# Cloud mode tests
+# ---------------------------------------------------------------------------
+
+
+_CLOUD_CONFIG: dict = {
+    "mode": "cloud",
+    "tenant_variable": "MY_CHROMA_TENANT",
+    "database_variable": "MY_CHROMA_DATABASE",
+    "api_key_variable": "MY_CHROMA_API_KEY",
+}
+
+
+class TestChromaCloudMode:
+    """Unit tests for ChromaBackend cloud mode — all network calls are mocked."""
+
+    def _cloud_backend(self, tmp_path: Path, cfg: dict | None = None) -> ChromaBackend:
+        return ChromaBackend(
+            kb_name="cloud_test_kb",
+            kb_path=tmp_path / "cloud_test_kb",
+            backend_config=cfg or _CLOUD_CONFIG,
+            embedding_function=_DeterministicEmbeddings(),
+        )
+
+    # ---- mode detection --------------------------------------------------
+
+    def test_is_cloud_true_when_mode_is_cloud(self, tmp_path: Path):
+        bk = self._cloud_backend(tmp_path)
+        assert bk._is_cloud is True  # noqa: SLF001
+
+    def test_is_cloud_false_when_mode_is_local(self, tmp_path: Path):
+        bk = ChromaBackend(
+            kb_name="local_kb",
+            kb_path=tmp_path / "local_kb",
+            backend_config={"mode": "local"},
+            embedding_function=_DeterministicEmbeddings(),
+        )
+        assert bk._is_cloud is False  # noqa: SLF001
+
+    def test_is_cloud_false_by_default(self, tmp_path: Path):
+        bk = ChromaBackend(
+            kb_name="default_kb",
+            kb_path=tmp_path / "default_kb",
+            embedding_function=_DeterministicEmbeddings(),
+        )
+        assert bk._is_cloud is False  # noqa: SLF001
+
+    # ---- credential resolution -------------------------------------------
+
+    async def test_resolve_secrets_api_key_is_required(self, tmp_path: Path):
+        from unittest.mock import AsyncMock, patch
+
+        bk = self._cloud_backend(tmp_path)
+        with (
+            patch.object(bk, "resolve_required_secret", new_callable=AsyncMock, return_value="key") as mock_req,
+            patch.object(bk, "resolve_secret", new_callable=AsyncMock, return_value=None),
+        ):
+            await bk._resolve_secrets()  # noqa: SLF001
+
+        # Only API key goes through resolve_required_secret.
+        calls = [c.args[0] for c in mock_req.call_args_list]
+        assert calls == ["MY_CHROMA_API_KEY"]
+
+    async def test_resolve_secrets_tenant_database_are_optional(self, tmp_path: Path):
+        from unittest.mock import AsyncMock, patch
+
+        bk = self._cloud_backend(tmp_path)
+        with (
+            patch.object(bk, "resolve_required_secret", new_callable=AsyncMock, return_value="key"),
+            patch.object(bk, "resolve_secret", new_callable=AsyncMock, return_value=None) as mock_opt,
+        ):
+            await bk._resolve_secrets()  # noqa: SLF001
+
+        # Tenant and database use resolve_secret (optional).
+        opt_calls = [c.args[0] for c in mock_opt.call_args_list]
+        assert "MY_CHROMA_TENANT" in opt_calls
+        assert "MY_CHROMA_DATABASE" in opt_calls
+
+    async def test_resolve_secrets_defaults_to_env_var_names(self, tmp_path: Path):
+        from unittest.mock import AsyncMock, patch
+
+        bk = ChromaBackend(
+            kb_name="cloud_kb",
+            kb_path=tmp_path / "cloud_kb",
+            backend_config={"mode": "cloud"},
+            embedding_function=_DeterministicEmbeddings(),
+        )
+        with (
+            patch.object(bk, "resolve_required_secret", new_callable=AsyncMock, return_value="key") as mock_req,
+            patch.object(bk, "resolve_secret", new_callable=AsyncMock, return_value=None) as mock_opt,
+        ):
+            await bk._resolve_secrets()  # noqa: SLF001
+
+        assert [c.args[0] for c in mock_req.call_args_list] == ["CHROMA_API_KEY"]
+        opt_calls = [c.args[0] for c in mock_opt.call_args_list]
+        assert "CHROMA_TENANT" in opt_calls
+        assert "CHROMA_DATABASE" in opt_calls
+
+    async def test_resolve_secrets_noop_in_local_mode(self, tmp_path: Path):
+        from unittest.mock import AsyncMock, patch
+
+        bk = ChromaBackend(
+            kb_name="local_kb",
+            kb_path=tmp_path / "local_kb",
+            backend_config={"mode": "local"},
+            embedding_function=_DeterministicEmbeddings(),
+        )
+        with (
+            patch.object(bk, "resolve_required_secret", new_callable=AsyncMock) as mock_req,
+            patch.object(bk, "resolve_secret", new_callable=AsyncMock) as mock_opt,
+        ):
+            await bk._resolve_secrets()  # noqa: SLF001
+
+        mock_req.assert_not_called()
+        mock_opt.assert_not_called()
+
+    # ---- client construction ---------------------------------------------
+
+    def test_build_vector_store_uses_cloud_client(self, tmp_path: Path):
+        from unittest.mock import MagicMock, patch
+
+        bk = self._cloud_backend(tmp_path)
+        bk._resolved_tenant = "t"  # noqa: SLF001
+        bk._resolved_database = "d"  # noqa: SLF001
+        bk._resolved_api_key = "k"  # noqa: SLF001
+
+        mock_client = MagicMock()
+        mock_client.get_or_create_collection.return_value = MagicMock()
+
+        with (
+            patch("chromadb.CloudClient", return_value=mock_client) as mock_cloud,
+            patch("chromadb.PersistentClient") as mock_local,
+        ):
+            bk._build_vector_store()  # noqa: SLF001
+
+        mock_cloud.assert_called_once()
+        mock_local.assert_not_called()
+
+    def test_get_cloud_client_passes_optional_host_port(self, tmp_path: Path):
+        from unittest.mock import patch
+
+        bk = ChromaBackend(
+            kb_name="cloud_kb",
+            kb_path=tmp_path / "cloud_kb",
+            backend_config={
+                "mode": "cloud",
+                "cloud_host": "custom.host.example",
+                "cloud_port": "8080",
+            },
+            embedding_function=_DeterministicEmbeddings(),
+        )
+        bk._resolved_tenant = "t"  # noqa: SLF001
+        bk._resolved_database = "d"  # noqa: SLF001
+        bk._resolved_api_key = "k"  # noqa: SLF001
+
+        with patch("chromadb.CloudClient") as mock_cloud:
+            bk._get_cloud_client()  # noqa: SLF001
+
+        _, kwargs = mock_cloud.call_args
+        assert kwargs["cloud_host"] == "custom.host.example"
+        assert kwargs["cloud_port"] == 8080
+
+    def test_get_cloud_client_omits_host_port_when_not_configured(self, tmp_path: Path):
+        from unittest.mock import patch
+
+        bk = self._cloud_backend(tmp_path)
+        bk._resolved_tenant = "t"  # noqa: SLF001
+        bk._resolved_database = "d"  # noqa: SLF001
+        bk._resolved_api_key = "k"  # noqa: SLF001
+
+        with patch("chromadb.CloudClient") as mock_cloud:
+            bk._get_cloud_client()  # noqa: SLF001
+
+        _, kwargs = mock_cloud.call_args
+        assert "cloud_host" not in kwargs
+        assert "cloud_port" not in kwargs
+
+    # ---- test_connection -------------------------------------------------
+
+    async def test_test_connection_cloud_success(self, tmp_path: Path):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        bk = self._cloud_backend(tmp_path)
+
+        mock_client = MagicMock()
+        with (
+            patch.object(bk, "_resolve_secrets", new_callable=AsyncMock),
+            patch.object(bk, "_get_cloud_client", return_value=mock_client),
+        ):
+            result = await bk.test_connection()
+
+        assert result.ok is True
+        assert "Cloud" in result.message
+        mock_client.heartbeat.assert_called()
+
+    async def test_test_connection_cloud_failure(self, tmp_path: Path):
+        from unittest.mock import AsyncMock, patch
+
+        bk = self._cloud_backend(tmp_path)
+
+        with (
+            patch.object(bk, "_resolve_secrets", new_callable=AsyncMock),
+            patch.object(bk, "_get_cloud_client", side_effect=ValueError("bad api key")),
+        ):
+            result = await bk.test_connection()
+
+        assert result.ok is False
+        assert "bad api key" in result.message
+
+    async def test_test_connection_cloud_credential_error_is_caught(self, tmp_path: Path):
+        from unittest.mock import AsyncMock, patch
+
+        bk = self._cloud_backend(tmp_path)
+
+        with patch.object(
+            bk,
+            "_resolve_secrets",
+            new_callable=AsyncMock,
+            side_effect=ValueError("Required credential variable 'MY_CHROMA_API_KEY' is not configured."),
+        ):
+            result = await bk.test_connection()
+
+        assert result.ok is False
+        assert "MY_CHROMA_API_KEY" in result.message
+
+    # ---- teardown / storage ----------------------------------------------
+
+    async def test_teardown_cloud_does_not_touch_shared_registry(self, tmp_path: Path):
+        from chromadb.api.shared_system_client import SharedSystemClient
+
+        bk = self._cloud_backend(tmp_path)
+        original_registry = dict(SharedSystemClient._identifier_to_system)  # noqa: SLF001
+        await bk.teardown()
+        assert SharedSystemClient._identifier_to_system == original_registry  # noqa: SLF001
+
+    async def test_storage_size_zero_in_cloud_mode(self, tmp_path: Path):
+        bk = self._cloud_backend(tmp_path)
+        assert await bk.storage_size_bytes() == 0
